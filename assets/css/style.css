@@ -234,6 +234,23 @@ main, footer { position: relative; z-index: 1; }
 .lattice.has-model .lattice-canvas { cursor: grab; }
 .lattice.is-dragging .lattice-canvas { cursor: grabbing; }
 .lattice.is-dropping { outline: 1px dashed rgba(255, 255, 255, 0.4); outline-offset: -1px; }
+/* callouts on the 3D model (lattice3d.js places them each frame); hidden until the model is in */
+.lattice .callouts, .lattice .callout-lines { position: absolute; inset: 0; z-index: 1; pointer-events: none; opacity: 0; transition: opacity 0.4s ease; } /* above the canvas and its grid lines */
+.lattice.has-callouts .callouts, .lattice.has-callouts .callout-lines { opacity: var(--callout-shown, 1); }
+.lattice.is-3d .callout-lines svg { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 1; overflow: visible; }
+.lattice .callout-lines path { stroke: rgba(255, 255, 255, 0.85); stroke-width: 1; fill: none; }
+.lattice .callout-lines .ring { stroke: #fff; stroke-width: 1.25; fill: none; opacity: 1; animation: none; }
+.lattice .callout-lines .dot { fill: #fff; stroke: none; }
+.lattice .callouts { margin: 0; padding: 0; list-style: none; font-family: "Oxanium", var(--font-sans); font-weight: 300; color: var(--fg); }
+.lattice .callouts > li {
+  position: absolute; white-space: nowrap; padding: 0 4px;
+  font-size: max(11px, calc(var(--callout-unit, 158px) * 0.076)); line-height: 1.2;
+}
+.lattice .callouts > li > span { display: block; margin-top: -0.6em; } /* centre the title on its leader */
+.lattice .callouts > li.left { text-align: right; }
+.lattice .callouts ul { margin: 0.45em 0 0; padding: 0; list-style: none; font-size: 0.85em; line-height: 1.25; }
+.lattice .callouts ul li::before { content: "-"; }
+.lattice:not(.is-3d) .callouts { display: none; }
 
 /* ---------- stacked project cards (home) ---------- */
 .stack { padding: 40px 0 120px; }
@@ -424,7 +441,8 @@ main, footer { position: relative; z-index: 1; }
 .cs-hero figure { margin: 0 0 0 25%; background: var(--card-bg); }
 .cs-hero img { width: 100%; max-height: 86vh; object-fit: contain; }
 @media (max-width: 809px) { .cs-hero { margin-top: 56px; } .cs-hero figure { margin: 0; } }
-.cs-hero .lattice { margin-top: 0; } /* Cántaro: the 3D scene replaces the hero image, full width */
+.cs-hero .lattice { margin-top: 0; } /* the 3D scene, full width */
+.cs-hero .lattice + figure { margin-top: 48px; } /* Reflectiv: hero image below the grid */
 
 .cs-body { display: grid; grid-template-columns: repeat(8, 1fr); padding-top: 120px; }
 .cs-content { grid-column: 1 / 6; padding-right: 48px; min-width: 0; }

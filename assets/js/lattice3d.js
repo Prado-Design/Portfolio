@@ -10,9 +10,8 @@
  *
  * Model: set data-model on .lattice to a .glb / .gltf / .stl / .obj file, e.g.
  *   <div class="lattice" data-model="/assets/models/ovul.glb"></div>
- * Dragging side to side spins only the model, through full turns, with a short coast; the grid
- * never turns sideways. Dragging up and down tilts model and grid together, slightly, and the
- * tilt eases back on release so the grid lines up with the page's column lines again.
+ * Dragging side to side (or the left/right arrow keys) spins only the model, through full turns,
+ * with a short coast; the grid itself stays fixed.
  * On localhost you can also drop a model file onto the lattice
  * or open /?model=/path/to/file.glb (or ?model=demo) to preview it.
  *
@@ -29,8 +28,9 @@ const PITCH = Math.asin(SLOPE);
 const LINE_COLOR = 0x333333; // matches the 2D lattice: white at 20% over black
 const MODEL_FILL = 0.28; // model's bounding sphere radius as a share of the smaller side
 const FLOAT_LIFT = 0.3; // how far the floating part starts above its seat, as a share of the model's height
-const TILT_LIMIT = THREE.MathUtils.degToRad(6); // how far a drag can tilt grid + model up/down
 const DRACO_PATH = "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/libs/draco/gltf/";
+const COLORWAY_HOLD_S = 3.5; // how long each colourway shows before the next fades in
+const COLORWAY_FADE_S = 1.2;
 
 const host = document.querySelector(".lattice");
 const isLocal = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
@@ -52,7 +52,7 @@ async function init() {
   const key = new THREE.DirectionalLight(0xffffff, 1.2);
   key.position.set(-1, 2, 1.5);
   scene.add(key);
-  // grid and model live in one group, so they always turn together in the same projection
+  // grid and model live in one group, in the same fixed projection
   const world = new THREE.Group();
   scene.add(world);
 
@@ -161,9 +161,10 @@ async function init() {
   const spin = new THREE.Group(); // holds the model, scaled to fit; aligned with the grid's axes
   world.add(spin);
   let model = null, modelRadius = 1;
-  // optional floating part (data-float-part="Lid"): lifted at the top of the page, lowered onto its
-  // modelled position as the visitor scrolls the grid toward the middle of the screen
-  let floatPart = null, floatBaseY = 0, floatLift = 0, floatStart = 0, floatEnd = 1;
+  // optional floating parts (data-float-part="Lid", or several: "Tablet, Pen"): lifted at the top of the
+  // page, lowered onto their modelled positions as the visitor scrolls the grid toward the middle of the
+  // screen. data-float-lift sets how high they start, as a share of the model's height (default FLOAT_LIFT).
+  let floatParts = [], floatLift = 0, floatStart = 0, floatEnd = 1;
   const floatProgress = () => {
     const t = Math.max(0, Math.min(1, (scrollY - floatStart) / (floatEnd - floatStart)));
     return t * t * (3 - 2 * t);
@@ -177,7 +178,8 @@ async function init() {
     floatEnd = Math.max(floatStart + 240, top + r.height / 2 - innerHeight / 2);
   };
   const applyFloat = () => {
-    if (floatPart) floatPart.position.y = floatBaseY + floatLift * (1 - floatProgress());
+    const lift = floatLift * (1 - floatProgress());
+    for (const f of floatParts) f.part.position.y = f.baseY + lift;
   };
 
   const fitModel = () => {
@@ -189,18 +191,22 @@ async function init() {
     if (model) { spin.remove(model); dispose(model); }
     const bounds = new THREE.Box3().setFromObject(obj);
     const centre = bounds.getCenter(new THREE.Vector3());
+    // data-seat="plane": the model stands on the grid's middle horizontal plane instead of straddling it
+    if (host.dataset.seat === "plane") centre.y = bounds.min.y;
     obj.position.sub(centre);
     modelRadius = bounds.getBoundingSphere(new THREE.Sphere()).radius || 1;
     model = obj;
-    floatPart = host.dataset.floatPart ? obj.getObjectByName(host.dataset.floatPart) || null : null;
-    if (floatPart) {
-      floatBaseY = floatPart.position.y;
-      floatLift = (bounds.max.y - bounds.min.y) * FLOAT_LIFT;
+    floatParts = (host.dataset.floatPart || "").split(",").map((n) => obj.getObjectByName(n.trim()))
+      .filter(Boolean).map((part) => ({ part, baseY: part.position.y }));
+    if (floatParts.length) {
+      floatLift = (bounds.max.y - bounds.min.y) * (parseFloat(host.dataset.floatLift) || FLOAT_LIFT);
       measureFloat();
     }
     spin.add(model);
-    rotY = rotX = 0;
+    rotY = 0;
     fitModel();
+    setupColorways();
+    setupCallouts();
     host.classList.add("has-model");
     host.removeAttribute("aria-hidden");
     canvas.tabIndex = 0;
@@ -237,18 +243,119 @@ async function init() {
     throw new Error(`unsupported model format: .${ext}`);
   };
 
-  /* ---------- turning: side to side spins the model (unlimited); up/down tilts model + grid ---------- */
-  let rotY = 0, rotX = 0, spinVel = 0, dragging = false, lastX = 0, lastY = 0, heldUntil = 0;
-  const qSpin = new THREE.Quaternion(), qTilt = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
+  /* ---------- callouts ---------- */
+  // optional <ul class="callouts"> inside .lattice; each <li> names a part (data-part), a point on it in
+  // the part's own coordinates (data-at="x y z"), and where its leader turns into the label (data-elbow, in
+  // eighths of the grid width from the grid's centre; class="left" puts the label on the left). Each
+  // frame the point is projected to the screen and joined to its label by a leader line, so the
+  // callouts follow the model as it spins and lowers into place.
+  const CALLOUT_TAIL = 0.53; // length of a leader's horizontal run, in eighths of the grid width
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  const calloutItems = [...host.querySelectorAll(".callouts > li")];
+  let callouts = [];
+  const calloutLayer = calloutItems.length ? document.createElement("div") : null;
+  if (calloutLayer) {
+    calloutLayer.className = "callout-lines";
+    calloutLayer.setAttribute("aria-hidden", "true");
+    calloutLayer.innerHTML = `<svg xmlns="${SVG_NS}"></svg>`;
+    host.append(calloutLayer);
+  }
+  const setupCallouts = () => {
+    const svg = calloutLayer?.firstChild;
+    if (!svg) return;
+    svg.replaceChildren();
+    callouts = calloutItems.map((li) => {
+      const part = model.getObjectByName(li.dataset.part);
+      if (!part) return null;
+      const g = document.createElementNS(SVG_NS, "g");
+      g.innerHTML = '<path/><ellipse class="ring"/><ellipse class="dot"/>';
+      svg.append(g);
+      return {
+        li, part, g, left: li.classList.contains("left"),
+        at: new THREE.Vector3(...li.dataset.at.trim().split(/\s+/).map(Number)),
+        elbow: li.dataset.elbow.trim().split(/\s+/).map(Number),
+      };
+    }).filter(Boolean);
+    host.classList.toggle("has-callouts", callouts.length > 0);
+  };
+  const placeCallouts = () => {
+    if (!callouts.length || !view) return;
+    const { W, H } = view;
+    const u = W / 8;
+    host.style.setProperty("--callout-unit", `${u}px`);
+    // shown once the floating parts have (nearly) settled, so the leaders don't swing about mid-flight
+    const p = floatParts.length ? floatProgress() : 1;
+    host.style.setProperty("--callout-shown", Math.max(0, Math.min(1, (p - 0.75) / 0.25)).toFixed(3));
+    const v = new THREE.Vector3();
+    for (const c of callouts) {
+      v.copy(c.at);
+      c.part.localToWorld(v).project(camera);
+      const ax = (v.x + 1) * W / 2, ay = (1 - v.y) * H / 2;
+      const ex = W / 2 + c.elbow[0] * u, ey = H / 2 + c.elbow[1] * u;
+      const tx = ex + (c.left ? -1 : 1) * CALLOUT_TAIL * u;
+      c.g.firstChild.setAttribute("d", `M${ax},${ay}L${ex},${ey}H${tx}`);
+      for (const [el, r] of [[c.g.children[1], 0.081], [c.g.children[2], 0.03]]) {
+        // a circle lying flat on the grid's horizontal planes, as the lattice draws its nodes
+        el.setAttribute("cx", ax); el.setAttribute("cy", ay);
+        el.setAttribute("rx", r * u); el.setAttribute("ry", r * u * SLOPE);
+      }
+      c.li.style.top = `${ey}px`;
+      if (c.left) { c.li.style.right = `${W - tx}px`; c.li.style.left = ""; }
+      else { c.li.style.left = `${tx}px`; c.li.style.right = ""; }
+    }
+  };
+
+  /* ---------- colourways ---------- */
+  // optional (data-colorway-material="Anodized Aluminium" data-colorways="#7a7a7a, #34453f, …"): that
+  // material cross-fades through the colours in turn while the grid is on screen
+  let colorway = null;
+  const setupColorways = () => {
+    if (colorway) clearTimeout(colorway.timer);
+    colorway = null;
+    const name = host.dataset.colorwayMaterial;
+    const colors = (host.dataset.colorways || "").split(",").map((c) => c.trim()).filter(Boolean).map((c) => new THREE.Color(c));
+    const mats = new Set();
+    model.traverse((m) => { if (m.isMesh) [].concat(m.material).forEach((mat) => { if (mat.name === name) mats.add(mat); }); });
+    if (!mats.size || colors.length < 2) return;
+    mats.forEach((mat) => mat.color.copy(colors[0]));
+    colorway = { mats: [...mats], colors, index: 0, from: new THREE.Color(), start: null, due: false, timer: 0 };
+    scheduleColorway();
+  };
+  const scheduleColorway = () => {
+    clearTimeout(colorway.timer);
+    colorway.timer = setTimeout(nextColorway, COLORWAY_HOLD_S * 1000);
+  };
+  const nextColorway = () => {
+    if (!visible) { colorway.due = true; return; } // picked up again when the grid scrolls back into view
+    colorway.due = false;
+    colorway.index = (colorway.index + 1) % colorway.colors.length;
+    colorway.from.copy(colorway.mats[0].color);
+    colorway.start = performance.now();
+    startLoop();
+  };
+  // advances a fade in progress; returns true while it is still running
+  const updateColorway = (now) => {
+    if (!colorway || colorway.start === null) return false;
+    const k = reduced ? 1 : Math.min(1, (now - colorway.start) / (COLORWAY_FADE_S * 1000));
+    const e = k * k * (3 - 2 * k);
+    colorway.mats.forEach((mat) => mat.color.copy(colorway.from).lerp(colorway.colors[colorway.index], e));
+    if (k < 1) return true;
+    colorway.start = null;
+    scheduleColorway();
+    return false;
+  };
+
+  /* ---------- turning: side to side spins the model (unlimited); the grid stays fixed ---------- */
+  let rotY = 0, spinVel = 0, dragging = false, lastX = 0;
+  const qSpin = new THREE.Quaternion(), Y = new THREE.Vector3(0, 1, 0);
   const clamp = (v, m) => Math.max(-m, Math.min(m, v));
   const SPIN_PER_PX = 0.01; // model spin, radians per dragged pixel
-  const TILT_PER_PX = 0.004; // tilt, radians per dragged pixel
   const COAST_S = 0.35; // how long the spin keeps coasting after release (time constant, seconds)
 
   canvas.addEventListener("pointerdown", (e) => {
     if (!model) return;
     dragging = true;
-    lastX = e.clientX; lastY = e.clientY;
+    lastX = e.clientX;
     canvas.setPointerCapture(e.pointerId);
     host.classList.add("is-dragging");
     startLoop();
@@ -258,48 +365,39 @@ async function init() {
     const turn = (e.clientX - lastX) * SPIN_PER_PX;
     rotY += turn;
     spinVel = clamp(turn * 60, 6); // radians/second for the coast, capped so a flick stays calm
-    if (e.pointerType === "mouse") rotX = clamp(rotX + (e.clientY - lastY) * TILT_PER_PX, TILT_LIMIT); // touch keeps vertical scroll
-    lastX = e.clientX; lastY = e.clientY;
+    lastX = e.clientX;
   });
   const release = () => { dragging = false; host.classList.remove("is-dragging"); };
   canvas.addEventListener("pointerup", release);
   canvas.addEventListener("pointercancel", release);
   canvas.addEventListener("keydown", (e) => {
-    const step = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] }[e.key];
+    const step = { ArrowLeft: -1, ArrowRight: 1 }[e.key];
     if (!step || !model) return;
     e.preventDefault();
-    rotY += step[0] * Math.PI / 12; // 15° per press
-    rotX = clamp(rotX + step[1] * TILT_LIMIT * 0.5, TILT_LIMIT);
-    heldUntil = performance.now() + 900; // hold the tilt briefly before easing back
-    startLoop();
+    rotY += step * Math.PI / 12; // 15° per press
+    render();
   });
 
   const render = () => {
     applyFloat();
-    qTilt.setFromAxisAngle(right, rotX); // tilt grid + model about the screen's horizontal axis
-    world.quaternion.copy(qTilt);
     qSpin.setFromAxisAngle(Y, rotY); // spin the model about the grid's vertical axis
     spin.quaternion.copy(qSpin);
     renderer.render(scene, camera);
+    placeCallouts(); // after rendering, so the parts' world matrices are current
   };
 
   let running = false, visible = true, lastT = 0;
-  const EASE_S = 0.12; // ease-back time constant in seconds (time-based, so slow frame rates settle just as fast)
   const tick = (t) => {
     if (!running) return;
     const dt = lastT ? Math.min(0.25, (t - lastT) / 1000) : 1 / 60;
     lastT = t;
+    const fading = updateColorway(performance.now());
     if (!dragging) {
       // the model's spin coasts to a stop and stays where it ends up
       rotY += spinVel * dt;
       spinVel = reduced ? 0 : spinVel * Math.exp(-dt / COAST_S);
       if (Math.abs(spinVel) < 1e-3) spinVel = 0;
-      // the tilt eases back to level
-      if (performance.now() > heldUntil) {
-        rotX -= rotX * (reduced ? 1 : 1 - Math.exp(-dt / EASE_S));
-        if (Math.abs(rotX) < 1e-4) rotX = 0; // exact rest: grid back on the page's pixel columns
-      }
-      if (!spinVel && !rotX && performance.now() > heldUntil) running = false;
+      if (!spinVel && !fading) running = false;
     }
     render();
     if (running) requestAnimationFrame(tick);
@@ -308,6 +406,8 @@ async function init() {
   new IntersectionObserver(([e]) => {
     visible = e.isIntersecting;
     if (!visible) running = false;
+    else if (colorway?.due) nextColorway();
+    else if (colorway?.start != null) startLoop(); // finish a fade that was cut off by scrolling away
   }).observe(host);
 
   /* ---------- layout ---------- */
@@ -316,7 +416,7 @@ async function init() {
   addEventListener("resize", measureFloat);
   let floatQueued = false;
   addEventListener("scroll", () => {
-    if (!floatPart || running || floatQueued) return; // a running loop renders it anyway
+    if (!floatParts.length || running || floatQueued) return; // a running loop renders it anyway
     floatQueued = true;
     requestAnimationFrame(() => { floatQueued = false; render(); });
   }, { passive: true });
@@ -340,13 +440,10 @@ async function init() {
       if (file) load(URL.createObjectURL(file), file.name).catch((err) => console.warn("[lattice3d]", err));
     });
     window.__lattice3d = {
-      renderer, render, view: () => view, load, rotation: () => ({ rotY, rotX }),
-      model: () => model, floatInfo: () => ({ part: floatPart && floatPart.name, floatBaseY, floatLift, floatStart, floatEnd, progress: floatProgress() }),
-      // hold a pose (radians, clamped to the limits) for ms, then ease back: for checking extremes
-      pose: (y, x = 0, ms = 4000) => {
-        rotY = y; rotX = clamp(x, TILT_LIMIT); spinVel = 0;
-        heldUntil = performance.now() + ms; startLoop();
-      },
+      renderer, render, view: () => view, load, rotation: () => ({ rotY }),
+      model: () => model, floatInfo: () => ({ parts: floatParts.map((f) => f.part.name), floatLift, floatStart, floatEnd, progress: floatProgress() }),
+      // turn the model to a spin angle (radians)
+      pose: (y) => { rotY = y; spinVel = 0; render(); },
     };
   }
 }
